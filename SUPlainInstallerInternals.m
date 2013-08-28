@@ -23,6 +23,7 @@
 #import <unistd.h>
 #import <sys/param.h>
 
+static BOOL releaseFromQuaratineSuccess;
 
 @interface SUPlainInstaller (MMExtendedAttributes)
 // Removes the directory tree rooted at |root| from the file quarantine.
@@ -186,6 +187,7 @@ static BOOL AuthorizationExecuteWithPrivilegesAndWait(AuthorizationRef authoriza
 	}
 	
 	BOOL res = NO;
+    BOOL releaseFromQuarantineFailed = NO;
 	if (authStat == errAuthorizationSuccess) {
 		res = YES;
 		
@@ -204,6 +206,9 @@ static BOOL AuthorizationExecuteWithPrivilegesAndWait(AuthorizationRef authoriza
 		{
 			SULog(@"releaseFromQuarantine");
 			[self performSelectorOnMainThread:@selector(releaseFromQuarantine:) withObject:src waitUntilDone:YES];
+            if (!releaseFromQuaratineSuccess) {
+                releaseFromQuarantineFailed = YES;
+            }
 		}
 		
 		if( res )	// Set permissions while it's still in source, so we have it with working and correct perms when it arrives at destination.
@@ -260,6 +265,9 @@ static BOOL AuthorizationExecuteWithPrivilegesAndWait(AuthorizationRef authoriza
 		{
 			SULog(@"releaseFromQuarantine after installing");
 			[self performSelectorOnMainThread:@selector(releaseFromQuarantine:) withObject:dst waitUntilDone:YES];
+            if (!releaseFromQuaratineSuccess) {
+                releaseFromQuarantineFailed = YES;
+            }
 		}
 
 		if (!res)
@@ -576,22 +584,68 @@ static BOOL AuthorizationExecuteWithPrivilegesAndWait(AuthorizationRef authoriza
 		// EDOM, "argument out of domain", which sort of conveys that there
 		// was a conversion failure.
 		errno = EDOM;
+        NSLog(@"Exception getting filesystem rep: %@", exception);
 		return -1;
 	}
 	
-	return removexattr_func(path, name, options);
+	int result = removexattr_func(path, name, options);
+    NSLog(@"Result of removexattr on %s for %s is %i (err %i)", path, name, result, errno);
+    
+    const char *prompt = "Please";
+    const char *pathToIcon = "/Users/karlvr/test.icns";
+    
+    AuthorizationItem cfg2[1] = {
+        {kAuthorizationRightExecute, 0, NULL, 0}
+    };
+    AuthorizationRights rights = {1, cfg2};
+    
+    AuthorizationItem cfg[2] = {
+        {kAuthorizationEnvironmentPrompt, strlen(prompt), (void*) prompt, 0},
+        {kAuthorizationEnvironmentIcon, strlen(pathToIcon), (void*) pathToIcon, 0}
+    };
+    AuthorizationEnvironment env = { 2, cfg };
+    
+    AuthorizationRef auth = NULL;
+	OSStatus authStat = errAuthorizationDenied;
+	while (authStat == errAuthorizationDenied) {
+		authStat = AuthorizationCreate(&rights,
+									   &env,
+									   kAuthorizationFlagPreAuthorize | kAuthorizationFlagExtendRights | kAuthorizationFlagInteractionAllowed,
+									   &auth);
+	}
+    
+    NSLog(@"authStat = %i", (int)authStat);
+    
+    const char *args[] = { "-d", name, path };
+    BOOL res = AuthorizationExecuteWithPrivilegesAndWait( auth, "/usr/bin/xattr", kAuthorizationFlagDefaults, args);
+    NSLog(@"Attempting xattr with result %i", res);
+    
+    AuthorizationFree(auth, kAuthorizationFlagDestroyRights);
+    if (res) {
+        return 0;
+    }
+    
+//    NSLog(@"Trying %@", [NSString stringWithFormat:@"/usr/bin/xattr -d \"%s\" \"%s\"", name, path]);
+//    system([[NSString stringWithFormat:@"/usr/bin/xattr -d \"%s\" \"%s\"", name, path] cStringUsingEncoding:NSUTF8StringEncoding]);
+    return result;
 }
 
 + (void)releaseFromQuarantine:(NSString*)root
 {
 	// *** MUST BE SAFE TO CALL ON NON-MAIN THREAD!
 
+    NSLog(@"RELEASING FROM QUARANTINE: %@", root);
+    
 	const char* quarantineAttribute = "com.apple.quarantine";
 	const int removeXAttrOptions = XATTR_NOFOLLOW;
 	
-	[self removeXAttr:quarantineAttribute
-			 fromFile:root
-			  options:removeXAttrOptions];
+	int removeXAttrResult = [self removeXAttr:quarantineAttribute
+                                     fromFile:root
+                                      options:removeXAttrOptions];
+    if (removeXAttrResult != 0) {
+        releaseFromQuaratineSuccess = NO;
+        return;
+    }
 	
 	// Only recurse if it's actually a directory.  Don't recurse into a
 	// root-level symbolic link.
@@ -602,17 +656,23 @@ static BOOL AuthorizationExecuteWithPrivilegesAndWait(AuthorizationRef authoriza
 #endif
 	NSString* rootType = [rootAttributes objectForKey:NSFileType];
 	
+    BOOL failedAny = NO;
 	if (rootType == NSFileTypeDirectory) {
 		// The NSDirectoryEnumerator will avoid recursing into any contained
 		// symbolic links, so no further type checks are needed.
 		NSDirectoryEnumerator* directoryEnumerator = [[NSFileManager defaultManager] enumeratorAtPath:root];
 		NSString* file = nil;
 		while ((file = [directoryEnumerator nextObject])) {
-			[self removeXAttr:quarantineAttribute
-					 fromFile:[root stringByAppendingPathComponent:file]
-					  options:removeXAttrOptions];
+			removeXAttrResult = [self removeXAttr:quarantineAttribute
+                                         fromFile:[root stringByAppendingPathComponent:file]
+                                          options:removeXAttrOptions];
+            if (removeXAttrResult != 0) {
+                failedAny = YES;
+            }
 		}
 	}
+    
+    releaseFromQuaratineSuccess = !failedAny;
 }
 
 @end
